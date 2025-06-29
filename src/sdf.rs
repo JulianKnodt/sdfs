@@ -1,7 +1,7 @@
 use super::sym::SymMatrix3;
 use super::to_mesh::{capsule_to_mesh, cylinder_caps, frustum_to_quad_mesh, ico_sphere};
 use super::{
-    add, cross, dot, kmul, length, normalize, orthogonal, quat_from_standard, quat_rot, sub, F,
+    F, add, cross, dot, kmul, length, normalize, orthogonal, quat_from_standard, quat_rot, sub,
 };
 use core::ops::Neg;
 use std::array::from_fn;
@@ -267,6 +267,13 @@ impl Cylinder {
         self.radius += d;
     }
 
+    pub fn contract_to(&mut self, p: impl Iterator<Item=[F; 3]>) {
+        self.radius = 0.;
+        self.radius = p.fold(F::INFINITY, |acc, n| {
+          acc.min(self.signed_dist(n))
+        });
+    }
+
     /// Computes the signed distance from a cylinder to a point
     pub fn signed_dist(&self, p: [F; 3]) -> F {
         assert!((length(self.axis) - 1.).abs() < 1e-4, "{self:?}");
@@ -345,6 +352,20 @@ impl CappedCylinder {
         }
         assert!(self.height >= 0., "{dist_h}");
     }
+    /// Contracts this cylinder to be maximal but not containing any points in `p`.
+    pub fn contract_to(&mut self, p: impl Iterator<Item=[F; 3]> + Clone) {
+        self.cylinder.contract_to(p.clone());
+        let [h_min, h_max] = p.fold([F::INFINITY, F::NEG_INFINITY], |[l,h], p| {
+          let dist_h = dot(self.cylinder.axis, sub(p, self.cylinder.p));
+          [l.min(dist_h), h.max(dist_h)]
+        });
+        assert!(h_min.is_finite());
+        assert!(h_max.is_finite());
+
+        self.cylinder.p = add(self.cylinder.p, kmul(h_min, self.cylinder.axis));
+        self.height = h_max - h_min;
+    }
+
     pub fn center(&self) -> [F; 3] {
         add(self.cylinder.p, kmul(self.height / 2., self.cylinder.axis))
     }
@@ -803,6 +824,9 @@ impl Sphere {
     pub fn expand_to(&mut self, v: [F; 3]) {
         self.radius = length(sub(v, self.center)).abs().max(self.radius);
     }
+    pub fn contract_to(&mut self, v: [F; 3]) {
+        self.radius = length(sub(v, self.center)).abs().min(self.radius);
+    }
     pub fn signed_dist(&self, v: [F; 3]) -> F {
         length(sub(v, self.center)) - self.radius
     }
@@ -919,11 +943,7 @@ impl OrientedBox {
             (0..3)
                 .map(|i| {
                     let a = kmul(self.radii[i], self.axes[i]);
-                    if axes_sign[i] {
-                        a.map(Neg::neg)
-                    } else {
-                        a
-                    }
+                    if axes_sign[i] { a.map(Neg::neg) } else { a }
                 })
                 .fold(self.center, add)
         })
@@ -939,6 +959,20 @@ impl OrientedBox {
         }
         let rs = self.axes.map(|a| dot(sub(v, self.center), a));
         self.radii = from_fn(|i| rs[i].abs().max(self.radii[i]))
+    }
+    /// Contracts this bounding box to be the maximal bounding box that encloses none of the
+    /// points.
+    pub fn contract_to(&mut self, p: impl Iterator<Item = [F; 3]>) {
+        // find point that is max along each axis??
+        // find point that is min along each axis??
+        todo!();
+        /*
+        self.radii = p.fold([F::INFINITY; 3], |acc, n| {
+            let rads = self.axes.map(|a| dot(sub(n, self.center), a).abs());
+            todo!();
+            std::array::from_fn(|i| acc[i].min(rads[i]))
+        });
+        */
     }
     /// Shrinks this obb to barely not contain v.
     pub fn shrink_below(&mut self, v: [F; 3]) {
@@ -1149,216 +1183,6 @@ fn test_obb_to_mesh() {
         let [i, j, k, l] = vis.map(|v| v + 1);
         println!("f {i} {j} {k} {l}");
     }
-}
-*/
-
-#[derive(Default, Debug, Clone, Copy, PartialEq)]
-pub struct IsoscelesTriangularPrism {
-    pub center: [F; 3],
-
-    pub axis: [F; 3],
-    pub half_length: F,
-
-    pub up: [F; 3],
-    pub half_height: F,
-
-    // L/R = cross(axis, up)
-    pub half_width: F,
-}
-
-impl IsoscelesTriangularPrism {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-    pub fn scale(&mut self, s: F) {
-        self.center = kmul(s, self.center);
-        self.half_length *= s;
-        self.half_height *= s;
-        self.half_width *= s;
-    }
-    pub fn expand_to(&mut self, op: [F; 3]) {
-        let p = sub(op, self.center);
-
-        self.half_length = self.half_length.max(dot(p, self.axis).abs());
-        let y = dot(p, self.up);
-        // tiny epsilon so that there will always be a little space to expand width later
-        self.half_height = self.half_height.max(y.abs() + 1e-10);
-
-        // width is trickier, because it depends on the height.
-        assert!((-self.half_height..=self.half_height).contains(&y));
-
-        // [-self.hh, self.hh] -> [-1, 1] -> [0, 2] -> [0,1] -> [0, 1] (flipped)
-        let y_ratio = (y / self.half_height) + 1.;
-        let y_ratio = 1. - (y_ratio / 2.);
-        assert!((0.0..=1.0).contains(&y_ratio));
-
-        let w = dot(self.r(), p).abs();
-
-        if w < 1e-6 {
-            return;
-        }
-
-        self.half_width = self.half_width.max(w / y_ratio);
-        //assert!(self.signed_dist(op) <= 1e-5, "{} {}", self.signed_dist(op), self.volume());
-    }
-    /// Constructs the set of all triangular prisms which fit inside this OBB.
-    #[inline]
-    pub fn from_obb(obb: &OrientedBox) -> impl Iterator<Item = Self> + '_ {
-        let center = obb.center;
-        [
-            [0, 1, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [0, 2, 1],
-            [1, 0, 2],
-            [2, 1, 0],
-        ]
-        .into_iter()
-        .map(move |[a0, a1, a2]| Self {
-            center,
-            axis: normalize(obb.axes[a0]),
-            half_length: obb.radii[a0],
-
-            up: normalize(obb.axes[a1]),
-            half_height: obb.radii[a1],
-
-            half_width: obb.radii[a2],
-        })
-        .flat_map(|t| [t, t.flip_vert()].into_iter())
-    }
-    fn flip_vert(&self) -> Self {
-        let mut s = *self;
-        s.up = s.up.map(Neg::neg);
-        s
-    }
-    #[inline]
-    fn r(&self) -> [F; 3] {
-        cross(self.axis, self.up)
-    }
-    pub fn signed_dist(&self, p: [F; 3]) -> F {
-        let lp = sub(p, self.center);
-        let [x, y, z] = [self.r(), self.up, self.axis].map(|a| dot(a, lp));
-
-        // TODO need to see if I'm swapping half length and half width
-        let [x, y] = [x.abs() - self.half_width, y + self.half_height];
-        let e = [-self.half_width, 2. * self.half_height];
-        let lin_dist = dot([x, y], e) / dot(e, e);
-        let q = sub([x, y], kmul(lin_dist.clamp(0., 1.), e));
-
-        let mut d1 = length(q);
-        if q[0].max(q[1]) < 0. {
-            d1 = -d1.min(y);
-        }
-        let d2 = z.abs() - self.half_length;
-
-        length([d1.max(0.), d2.max(0.)]) + d1.max(d2).min(0.)
-    }
-    pub fn corners(&self) -> [[F; 3]; 6] {
-        let t0_center = sub(self.center, kmul(self.half_length, self.axis));
-        let base_point = add(kmul(-self.half_height, self.up), t0_center);
-        let r = self.r();
-        let [t0a, t0b, t0c] = [
-            add(kmul(self.half_height, self.up), t0_center),
-            add(base_point, kmul(self.half_width, r)),
-            add(base_point, kmul(-self.half_width, r)),
-        ];
-
-        let shift = kmul(2. * self.half_length, self.axis);
-        [
-            t0a,
-            t0b,
-            t0c,
-            add(shift, t0a),
-            add(shift, t0b),
-            add(shift, t0c),
-        ]
-    }
-    pub fn volume(&self) -> F {
-        self.half_height * self.half_width * self.half_length * 4.
-    }
-    /// Returns the indices of points that describes this triangular prism.
-    pub fn to_mesh(&self) -> ([[usize; 4]; 3], [[usize; 3]; 2]) {
-        let caps = [[0, 2, 1], [3, 4, 5]];
-        let faces = [[0, 1, 4, 3], [1, 2, 5, 4], [2, 0, 3, 5]];
-        (faces, caps)
-    }
-}
-
-/*
-#[test]
-fn test_tri_prism() {
-    let prism = IsoscelesTriangularPrism {
-        center: [0.; 3],
-        axis: [1., 0., 0.],
-        up: [0., 1., 0.],
-        half_height: 10.,
-        half_width: 10.,
-        half_length: 1.,
-    };
-
-    for v in prism.corners() {
-        assert_eq!(prism.signed_dist(v), 0.);
-    }
-    assert_eq!(prism.signed_dist([0.; 3]), -1.);
-}
-*/
-
-/*
-#[test]
-fn test_obb_to_tri_to_mesh() {
-    let obb = OrientedBox::new([0.; 3], [[2., 0., 0.], [0., 1., 0.], [0., 0., 1.]]);
-    let (vs, f) = obb.to_mesh();
-    for [x, y, z] in vs {
-        println!("v {x} {y} {z}");
-    }
-    for vis in f {
-        let [i, j, k, l] = vis.map(|v| v + 1);
-        println!("f {i} {j} {k} {l}");
-    }
-
-    let prism = IsoscelesTriangularPrism::from_obb(&obb).next().unwrap();
-    for [x, y, z] in prism.corners() {
-        println!("v {x} {y} {z}");
-    }
-
-    let (faces, caps) = prism.to_mesh();
-    for vis in faces {
-        let [i, j, k, l] = vis.map(|v| v + 1 + vs.len());
-        println!("f {i} {j} {k} {l}");
-    }
-    for vis in caps {
-        let [i, j, k] = vis.map(|v| v + 1 + vs.len());
-        println!("f {i} {j} {k}");
-    }
-    todo!();
-}
-*/
-
-/*
-#[test]
-fn test_tri_prism_to_mesh() {
-    let prism = IsoscelesTriangularPrism {
-        center: [0.; 3],
-        axis: [1., 0., 0.],
-        up: [0., 1., 0.],
-        half_height: 10.,
-        half_width: 5.,
-        half_length: 1.,
-    };
-    for [x, y, z] in prism.corners() {
-        println!("v {x} {y} {z}");
-    }
-
-    let (faces, caps) = prism.to_mesh();
-    for vis in faces {
-        let [i, j, k, l] = vis.map(|v| v + 1);
-        println!("f {i} {j} {k} {l}");
-    }
-    for vis in caps {
-        let [i, j, k] = vis.map(|v| v + 1);
-        println!("f {i} {j} {k}");
-    }
-    todo!();
 }
 */
 
@@ -1705,125 +1529,6 @@ fn test_trap_prism_to_mesh() {
 }
 */
 
-/// An 18 sided discrete oriented polytope.
-/// The axes are half-way vectors between each set of primary axes
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct K18DOP {
-    primary_axes: [[F; 3]; 3],
-    radii: [[F; 2]; 9],
-    center: [F; 3],
-    rot: [F; 4],
-}
-
-impl K18DOP {
-    pub fn new(ob: OrientedBox) -> Self {
-        Self {
-            primary_axes: ob.axes,
-            radii: std::array::from_fn(|i| {
-                ob.radii
-                    .get(i)
-                    .map(|&r| [-r, r])
-                    .unwrap_or([F::NEG_INFINITY, F::INFINITY])
-            }),
-            center: ob.center,
-            rot: ob.rot,
-        }
-    }
-    /// Returns all axes for this DOP. Note that each axes corresponds to 2 values,
-    /// One positive and one negative
-    pub fn axes(&self) -> [[F; 3]; 9] {
-        let [a0, a1, a2] = self.primary_axes;
-        const SQRT2: F = std::f64::consts::SQRT_2 as F;
-        let halfway = |a, b| kmul(SQRT2, add(a, b));
-        let flip_on = |v, on| sub(v, kmul(2. * dot(v, on), on));
-
-        let ha01 = halfway(a0, a1);
-        let ha12 = halfway(a1, a2);
-        let ha20 = halfway(a2, a0);
-
-        let ha01f0 = flip_on(ha01, a0);
-        let ha12f1 = flip_on(ha12, a1);
-        let ha20f2 = flip_on(ha20, a2);
-
-        [a0, a1, a2, ha01, ha12, ha20, ha01f0, ha12f1, ha20f2]
-    }
-    pub fn zero(&mut self) {
-        self.radii.fill([F::INFINITY, F::NEG_INFINITY]);
-    }
-    /// Compute the volume of this discrete oriented polytope.
-    pub fn volume(&self) -> F {
-        todo!()
-    }
-    pub fn expand_many(&mut self, ps: impl Iterator<Item = [F; 3]>) {
-        let axes = self.axes();
-        for p in ps {
-            let local_p = sub(p, self.center);
-            for (ai, &axis) in axes.iter().enumerate() {
-                let [lb, ub] = self.radii[ai];
-                let d = dot(local_p, axis);
-                self.radii[ai] = [lb.min(d), ub.max(d)]
-            }
-        }
-    }
-    pub fn internal_signed_dist(&self, p: [F; 3]) -> F {
-        let lp = sub(p, self.center);
-        let a = self.axes().map(|a| dot(a, lp));
-        let q: [F; 9] = std::array::from_fn(|i| {
-            let [lb, ub] = self.radii[i];
-            a[i].abs() - if a[i] < 0. { lb } else { ub }
-        });
-
-        length(q.map(|v| v.max(0.))) + q.into_iter().max_by(F::total_cmp).unwrap_or(0.).min(0.)
-    }
-    pub fn contains(&self, p: [F; 3]) -> bool {
-        let lp = sub(p, self.center);
-        self.axes().into_iter().enumerate().all(|(ai, a)| {
-            let [lb, ub] = self.radii[ai];
-            (lb..=ub).contains(&dot(a, lp))
-        })
-    }
-    pub fn to_mesh(&self) -> (Vec<[F; 3]>, Vec<Vec<usize>>) {
-        let c = self.center;
-        let axes = self.axes();
-        let p = |px: bool, py: bool, pz: bool| {
-            let mut curr = c;
-            for (i, p) in [px, py, pz].into_iter().enumerate() {
-                let m = if p {
-                    self.radii[i][1]
-                } else {
-                    self.radii[i][0]
-                };
-                curr = add(curr, kmul(m, axes[i]));
-            }
-            curr
-        };
-        let verts = [
-            p(false, false, false),
-            p(false, false, true),
-            p(false, true, false),
-            p(false, true, true),
-            p(true, false, false),
-            p(true, false, true),
-            p(true, true, false),
-            p(true, true, true),
-        ]
-        .to_vec();
-        let faces = [
-            [0, 1, 3, 2],
-            [6, 7, 5, 4],
-            [4, 5, 1, 0],
-            [7, 6, 2, 3],
-            [3, 1, 5, 7],
-            [6, 4, 0, 2],
-        ]
-        .map(|v| v.to_vec())
-        .to_vec();
-
-        // for each vertex, should store which axes it is bound by?
-        (verts, faces)
-    }
-}
-
 // kept for visualization purposes?
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cone {
@@ -2011,11 +1716,7 @@ impl Frustum {
         let v = (sqr(cax) + sqr(cay) * baba)
             .min(sqr(cbx) + sqr(cby) * baba)
             .sqrt();
-        if cbx < 0. && cay < 0. {
-            -v
-        } else {
-            v
-        }
+        if cbx < 0. && cay < 0. { -v } else { v }
     }
     pub fn to_mesh(
         &self,
